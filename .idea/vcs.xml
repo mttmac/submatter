@@ -2,8 +2,8 @@
 <project version="4">
   <component name="VcsDirectoryMappings">
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/deep-head-pose" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/depthai" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/depthai-python" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/ref/deep-head-pose" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/ref/depthai" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/ref/depthai-python" vcs="Git" />
   </component>
 </project>
