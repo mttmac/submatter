@@ -4,3 +4,4 @@ opencv-python==4.2.0.34; platform_machine != "armv7l"
 opencv-python==4.1.0.25; platform_machine == "armv7l"
 depthai==2.1.0.0
 imutils>=0.5.3
+ffmpeg-python>=0.2.0

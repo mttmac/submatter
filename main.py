@@ -37,9 +37,11 @@ import depthai as dai
 from queue import Queue
 import threading
 
+import ffmpeg
 from imutils.video import FPS
 
 import time
+
 
 def timer(function):
     """
@@ -64,13 +66,14 @@ class Session:
         self.debug = debug
 
         # Init local storage
-        self.label = f"session-{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+        self.label = f"session-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
         self.store = Path('sessions', self.label).resolve().absolute()
         os.makedirs(str(self.store))
         self.meta = {}
 
         # Init camera
-        self.device = dai.Device(self.create_pipeline())
+        self.pipeline = self.create_pipeline()
+        self.device = dai.Device(self.pipeline)
         print("Starting camera pipeline...")
         self.running = self.device.startPipeline()
         self.video = self.device.getOutputQueue('cam_out', maxSize=30, blocking=True)
@@ -79,9 +82,12 @@ class Session:
         self.stream = self.device.getOutputQueue('cam_preview', maxSize=1, blocking=False)
         self.stream_start = None
         self.threads = []
+        time.sleep(1)  # wait for camera to boot
         if self.debug:
             self.fps = FPS()
             self.fps.start()
+            print('Debug mode on.')
+        print('Camera stream started.')
 
         # Init neural net inference queues
         self.frame = None
@@ -150,7 +156,7 @@ class Session:
             model_xout.setStreamName(name)
             model.out.link(model_xout.input)
         print('Neural networks created.')
-
+        print('Camera pipeline created.')
         return pipeline
 
     def elapsed_ms(self, timedelta):
@@ -160,24 +166,26 @@ class Session:
             self.stream_start = ms
         return ms - self.stream_start
 
-    def grab_frame(self, retries=0):
-        msg = self.stream.get()
-        frame = msg.getFrame()
-        self.frame = frame.transpose(1, 2, 0).astype(np.uint8)  # correct order and bitsize
-        self.timestamp = self.elapsed_ms(msg.getTimestamp())
-        self.meta[self.timestamp] = {}  # create empty dict for timestamp
-        if self.debug:
-            self.fps.update()
+    def grab_frame(self):
+        msg = self.stream.tryGet()
+        if msg:
+            frame = msg.getFrame()
+            self.frame = frame.transpose(1, 2, 0).astype(np.uint8)  # correct order and bitsize
+            self.timestamp = self.elapsed_ms(msg.getTimestamp())
+            self.meta[self.timestamp] = {}  # create empty dict for timestamp
+            if self.debug:
+                self.fps.update()
 
     def run_face_detection(self):
         detect_q = self.device.getOutputQueue('detect')
         landmark_qin = self.device.getInputQueue('landmark_in', maxSize=4, blocking=False)
 
         while self.running:
-            if self.frame is None:
-                continue
             # Get NN output and filter for bounding boxes with >70% confidence
-            bboxes = np.array(detect_q.get().getFirstLayerFp16())
+            msg = detect_q.tryGet()
+            if msg is None or self.frame is None:
+                continue
+            bboxes = np.array(msg.getFirstLayerFp16())
             bboxes = bboxes.reshape((bboxes.size // 7, 7))
             self.bboxes = bboxes[bboxes[:, 2] > 0.7][:, 3:7]
 
@@ -190,31 +198,32 @@ class Session:
                 raw_bbox = np.clip(raw_bbox, 0, 1)
                 bbox = (raw_bbox * bounds).astype(int)
 
-                # Queue up bounding box for landmarking reference
-                self.bbox_q.put(bbox)
-
                 # Store bounding box position as proportion of frame
                 self.meta[self.timestamp]['bbox_coords'] = raw_bbox.tolist()
 
                 # Queue up cropped frame for input to landmark NN
                 bbox_frame = self.frame[bbox[1]:bbox[3], bbox[0]:bbox[2]]
-                bbox_data = cv2.resize(bbox_frame, (160, 160)).transpose(2, 0, 1).flatten()
-                tensor = dai.NNData().setLayer('data', bbox_data.tolist())
+                bbox_data = cv2.resize(bbox_frame, (160, 160)).transpose(2, 0, 1)
+                bbox_data = bbox_data.flatten().tolist()
+                tensor = dai.NNData().setLayer('data', bbox_data)
                 landmark_qin.send(tensor)
+
+                # Queue up bounding box for landmarking reference
+                self.bbox_q.put(bbox)
 
     def run_face_landmarking(self):
         landmark_q = self.device.getOutputQueue('landmark', maxSize=4, blocking=False)
 
         while self.running:
-            while self.bboxes:
+            while len(self.bboxes):
                 # Retrieve landmark points
-                msg = landmark_q.get()
+                msg = landmark_q.tryGet()
+                if msg is None:
+                    continue
                 raw_pts = None
                 for tensor in msg.getRaw().tensors:
                     if tensor.name == 'StatefulPartitionedCall/strided_slice_2/Split.0':
                         raw_pts = np.array(msg.getLayerFp16(tensor.name))
-                if raw_pts is None:
-                    continue
 
                 # Convert coordinate points to full frame pixels
                 face_bbox = self.bbox_q.get()
@@ -315,16 +324,15 @@ class Session:
             thread.start()
 
         # Run loop
-        with open(self.store / 'session.h265', 'wb') as video:
+        with open(self.store / 'session.h265', 'wb') as file:
             while self.running:
                 # Grab frame for preview and inference
                 self.grab_frame()
 
                 # Save queued raw frames to video file
-                try:
-                    self.video.get().getData().tofile(video)
-                except RuntimeError:
-                    pass
+                msg = self.video.tryGet()
+                if msg:
+                    msg.getData().tofile(file)
 
                 # Update preview window
                 if self.debug:
@@ -369,6 +377,7 @@ class Session:
 
         self.finish()
         self.write_json()
+        self.convert_video()
         self.upload_data()
         print('Session ended.')
 
@@ -389,6 +398,12 @@ class Session:
     def write_json(self):
         with open(self.store / 'meta.txt', 'w') as file:
             json.dump(self.meta, file)
+        print('Meta JSON file created.')
+
+    def convert_video(self):
+        if self.debug:
+            ffmpeg.input(self.store / 'session.h265').output(self.store / 'session.mp4').run()
+            print('Video file converted to mp4.')
 
     def upload_data(self):
         # TODO implement cloud upload
@@ -397,4 +412,4 @@ class Session:
 
 if __name__ == '__main__':
     sess = Session()
-    # sess.run()
+    sess.run()
