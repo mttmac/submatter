@@ -1,28 +1,45 @@
-import argparse
-from datetime import datetime, timedelta
+#!/usr/bin/env python3
+
+"""
+Submatter head movement tracker
+Matt MacDonald, Subhash Talluri 2021
+
+Main camera controller
+Starts a video stream, detects head pose, extracts vectors and logs in json for upload
+Stores raw video and disparity for subsequent analysis on the cloud
+
+Based on https://github.com/luxonis/depthai-experiments gen2-head-posture-detection experiment
+
+Trained neural networks sourced from OpenVino toolkit:
+face-detection-retail-0004 (SSD face detection)
+Unknown blob!!! facial-landmarks-35-adas-0002 (CNN facial landmarks estimation)
+Future:
+head-pose-estimation-adas-0001 (CNN head pose estimation)
+gaze-estimation-adas-0002 (VGG eye gaze estimation)
+"""
+# TODO use disparity depth calcualtion to improve accuracy of landmarking
+# TODO add rectified disparity video file saving
+# TODO Upgrade face detection to 0005
+# TODO implement a known facial landmarks estimator
+# TODO add tracking to faces for consistency
+
+
+import datetime
+import os
+import json
 from pathlib import Path
+
+import math
 import cv2
 import numpy as np
-import depthai
-import time
-from tools import *
-from imutils.video import FPS
-import queue
+import depthai as dai
+
+from queue import Queue
 import threading
 
-parser = argparse.ArgumentParser()
-parser.add_argument('-nd', '--no-debug', action="store_true", help="Prevent debug output")
-parser.add_argument('-cam', '--camera', action="store_true", help="Use DepthAI 4K RGB camera for inference (conflicts with -vid)")
-parser.add_argument('-vid', '--video', type=str, help="Path to video file to be used for inference (conflicts with -cam)")
-args = parser.parse_args()
+from imutils.video import FPS
 
-debug = not args.no_debug
-camera = not args.video
-
-if args.camera and args.video:
-    raise ValueError("Incorrect command line parameters! \"-cam\" cannot be used with \"-vid\"!")
-elif args.camera is False and args.video is None:
-    raise ValueError("Missing inference source! Either use \"-cam\" to run on DepthAI camera or \"-vid <path>\" to run on video file")
+import time
 
 def timer(function):
     """
@@ -41,248 +58,327 @@ def timer(function):
     return wrapper
 
 
-def to_planar(arr: np.ndarray, shape: tuple) -> list:
-    return [val for channel in cv2.resize(arr, shape).transpose(2, 0, 1) for y_col in channel for val in y_col]
+class Session:
+    def __init__(self, debug=True):
+        print('Starting session...')
+        self.debug = debug
 
-def to_tensor_result(packet):
-    return {
-        name: np.array(packet.getLayerFp16(name))
-        for name in [tensor.name for tensor in packet.getRaw().tensors]
-    }
+        # Init local storage
+        self.label = f"session-{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+        self.store = Path('sessions', self.label).resolve().absolute()
+        os.makedirs(str(self.store))
+        self.meta = {}
 
+        # Init camera
+        self.device = dai.Device(self.create_pipeline())
+        print("Starting camera pipeline...")
+        self.running = self.device.startPipeline()
+        self.video = self.device.getOutputQueue('cam_out', maxSize=30, blocking=True)
 
-def frame_norm(frame, bbox):
-    norm_vals = np.full(len(bbox), frame.shape[0])
-    norm_vals[::2] = frame.shape[1]
-    return (np.clip(np.array(bbox), 0, 1) * norm_vals).astype(int)
+        # Init streaming
+        self.stream = self.device.getOutputQueue('cam_preview', maxSize=1, blocking=False)
+        self.stream_start = None
+        self.threads = []
+        if self.debug:
+            self.fps = FPS()
+            self.fps.start()
 
-def coordinate(frame, *xy_vals):
-    height, width = frame.shape[:2]
-    result = []
-    for i, val in enumerate(xy_vals):
-        if i % 2 == 0:
-            result.append(max(0, min(width, int(val * width))))
-        else:
-            result.append(max(0, min(height, int(val * height))))
-    return result
-
-def create_pipeline():
-    print("Creating pipeline...")
-    pipeline = depthai.Pipeline()
-    if camera:
-        print("Creating Color Camera...")
-        cam = pipeline.createColorCamera()
-        cam.setPreviewSize(300,300)
-        cam.setResolution(depthai.ColorCameraProperties.SensorResolution.THE_1080_P)
-        cam.setInterleaved(False)
-        cam.setBoardSocket(depthai.CameraBoardSocket.RGB)
-        cam_xout = pipeline.createXLinkOut()
-        cam_xout.setStreamName("cam_out")
-        cam.preview.link(cam_xout.input)
-        first_models(cam,pipeline,"models/face-detection-retail-0004_openvino_2020_1_4shave.blob","face")
-    else:
-        models(pipeline,"models/face-detection-retail-0004_openvino_2020_1_4shave.blob","face")
-    models(pipeline,"models/face_landmark_160x160_openvino_2020_1_4shave.blob","land68")
-    return pipeline
-
-def first_models(cam,pipeline,model_path,name):
-    print(f"Start creating{model_path}Neural Networks")
-    model_nn = pipeline.createNeuralNetwork()
-    model_nn.setBlobPath(str(Path(model_path).resolve().absolute()))
-    cam.preview.link(model_nn.input)
-    model_nn_xout = pipeline.createXLinkOut()
-    model_nn_xout.setStreamName(f"{name}_nn")
-    model_nn.out.link(model_nn_xout.input)
-
-def models(pipeline,model_path,name):
-    print(f"Start creating{model_path}Neural Networks")
-    model_in = pipeline.createXLinkIn()
-    model_in.setStreamName(f"{name}_in")
-    model_nn = pipeline.createNeuralNetwork()
-    model_nn.setBlobPath(str(Path(model_path).resolve().absolute()))
-    model_nn_xout = pipeline.createXLinkOut()
-    model_nn_xout.setStreamName(f"{name}_nn")
-    model_in.out.link(model_nn.input)
-    model_nn.out.link(model_nn_xout.input)
-
-class Main:
-    def __init__(self):
-        print("Loading pipeline...")
-        self.start_pipeline()
-        if not camera:
-            self.cap = cv2.VideoCapture(str(Path(args.video).resolve().absolute()))
-        self.fps = FPS()
-        self.fps.start()
+        # Init neural net inference queues
         self.frame = None
-        self.face_box_q = queue.Queue()
+        self.timestamp = None
         self.bboxes = []
-        self.running = True
-        self.result = None
-        self.face_bbox = None
+        self.bbox_q = Queue()
+        self.face_q = Queue()
+        self.mark_q = Queue()
+        self.unit_q = Queue()
 
-    def start_pipeline(self):
-        self.device = depthai.Device(create_pipeline())
-        print("Starting pipeline...")
-        self.device.startPipeline()
-        if camera:
-            self.cam_out = self.device.getOutputQueue("cam_out",1,False)
-        else:
-            self.face_in = self.device.getInputQueue("face_in")
+        # Init camera pixel coordinate system (xy): camera eigen and distortion coefficients
+        # Camera coordinate system (XYZ): camera internal matrix [fx, 0, cx; 0, fy, cy; 0, 0, 1]
+        self.K = np.float32([6.5308391993466671e+002, 0.0, 3.1950000000000000e+002,
+                             0.0, 6.5308391993466671e+002, 2.3950000000000000e+002,
+                             0.0, 0.0, 1.0]).reshape(3, 3)
+        # Image center coordinate system (uv): camera distortion coefficients [k1, k2, p1, p2, k3]
+        self.D = np.float32([7.0834633684407095e-002, 6.9140193737175351e-002,
+                             0.0, 0.0, -1.3073460323689292e+000]).reshape(5, 1)
 
-    def draw_bbox(self, bbox, color):
-        cv2.rectangle(self.debug_frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
+    @staticmethod
+    def create_pipeline():
+        print('Creating camera pipeline...')
+        pipeline = dai.Pipeline()
 
-    def run_face(self):
-        face_nn = self.device.getOutputQueue("face_nn")
-        land68_in = self.device.getInputQueue("land68_in",4,False)
+        # Setup RGB camera to capture 1080P
+        cam = pipeline.createColorCamera()
+        cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+        cam.setInterleaved(False)
+        cam.setBoardSocket(dai.CameraBoardSocket.RGB)
+
+        # Setup video encoder stream for storage
+        cam_xout = pipeline.createXLinkOut()
+        cam_xout.setStreamName('cam_out')
+        enc = pipeline.createVideoEncoder()
+        cam.video.link(enc.input)
+        enc_fps = 25
+        enc.setDefaultProfilePreset(cam.getResolutionSize(), enc_fps,
+                                    dai.VideoEncoderProperties.Profile.H265_MAIN)
+        enc.bitstream.link(cam_xout.input)
+
+        # Setup preview stream for display and inference
+        cam_xpre = pipeline.createXLinkOut()
+        cam_xpre.setStreamName("cam_preview")
+        cam.setPreviewSize(300, 300)
+        cam.preview.link(cam_xpre.input)
+        print('Video streams created.')
+
+        # Setup neural networks for inference
+        models = {'detect': 'face-detection-retail-0004_openvino_2020_1_4shave.blob',
+                  'landmark': 'face_landmark_160x160_openvino_2020_1_4shave.blob'}
+        first_model = 'detect'
+        for name, blob in models.items():
+            blob_path = Path('models', blob).resolve().absolute()
+            model = pipeline.createNeuralNetwork()
+            model.setBlobPath(str(blob_path))
+
+            if name == first_model:
+                # Feed video stream to nnet
+                cam.preview.link(model.input)
+            else:
+                # Feed model output from host to nnet
+                model_xin = pipeline.createXLinkIn()
+                model_xin.setStreamName(f"{name}_in")
+                model_xin.out.link(model.input)
+            model_xout = pipeline.createXLinkOut()
+            model_xout.setStreamName(name)
+            model.out.link(model_xout.input)
+        print('Neural networks created.')
+
+        return pipeline
+
+    def elapsed_ms(self, timedelta):
+        ms = ((timedelta.days * 24 * 60 * 60 + timedelta.seconds) * 1000 +
+              (timedelta.microseconds / 1000))
+        if self.stream_start is None:
+            self.stream_start = ms
+        return ms - self.stream_start
+
+    def grab_frame(self, retries=0):
+        msg = self.stream.get()
+        frame = msg.getFrame()
+        self.frame = frame.transpose(1, 2, 0).astype(np.uint8)  # correct order and bitsize
+        self.timestamp = self.elapsed_ms(msg.getTimestamp())
+        self.meta[self.timestamp] = {}  # create empty dict for timestamp
+        if self.debug:
+            self.fps.update()
+
+    def run_face_detection(self):
+        detect_q = self.device.getOutputQueue('detect')
+        landmark_qin = self.device.getInputQueue('landmark_in', maxSize=4, blocking=False)
+
         while self.running:
             if self.frame is None:
                 continue
-            bboxes = np.array(face_nn.get().getFirstLayerFp16())
+            # Get NN output and filter for bounding boxes with >70% confidence
+            bboxes = np.array(detect_q.get().getFirstLayerFp16())
             bboxes = bboxes.reshape((bboxes.size // 7, 7))
             self.bboxes = bboxes[bboxes[:, 2] > 0.7][:, 3:7]
+
+            # TODO filter to track one bbox only or track individuals
+            # TODO add a confidence filter for landmarking as well
             for raw_bbox in self.bboxes:
-                bbox = frame_norm(self.frame, raw_bbox)
-                det_frame = self.frame[bbox[1]:bbox[3], bbox[0]:bbox[2]]
+                # Convert bounding box coordinates to pixels
+                y_size, x_size = self.frame.shape[:2]
+                bounds = np.array([x_size, y_size] * (raw_bbox.size // 2))
+                raw_bbox = np.clip(raw_bbox, 0, 1)
+                bbox = (raw_bbox * bounds).astype(int)
 
-                land68_data = depthai.NNData()
-                land68_data.setLayer("data", to_planar(det_frame, (160,160)))
-                land68_in.send(land68_data)
-                self.face_box_q.put(bbox)
+                # Queue up bounding box for landmarking reference
+                self.bbox_q.put(bbox)
 
-    def run_land68(self):
-        land68_nn = self.device.getOutputQueue("land68_nn",4,False)
+                # Store bounding box position as proportion of frame
+                self.meta[self.timestamp]['bbox_coords'] = raw_bbox.tolist()
+
+                # Queue up cropped frame for input to landmark NN
+                bbox_frame = self.frame[bbox[1]:bbox[3], bbox[0]:bbox[2]]
+                bbox_data = cv2.resize(bbox_frame, (160, 160)).transpose(2, 0, 1).flatten()
+                tensor = dai.NNData().setLayer('data', bbox_data.tolist())
+                landmark_qin.send(tensor)
+
+    def run_face_landmarking(self):
+        landmark_q = self.device.getOutputQueue('landmark', maxSize=4, blocking=False)
 
         while self.running:
-            self.results = queue.Queue()
-            self.face_bboxs = queue.Queue()
-            while len(self.bboxes):
-                face_bbox = self.face_box_q.get()
-                face_bbox[1] -= 15
-                face_bbox[3] += 15
-                face_bbox[0] -= 15
-                face_bbox[2] += 15
-                self.face_bboxs.put(face_bbox)
-                face_frame = self.frame[
-                    face_bbox[1]:face_bbox[3],
-                    face_bbox[0]:face_bbox[2]
-                ]
-                land68_data = land68_nn.get()
-                out = to_tensor_result(land68_data).get('StatefulPartitionedCall/strided_slice_2/Split.0')
-                result = coordinate(face_frame,*out)
-                self.results.put(result)
+            while self.bboxes:
+                # Retrieve landmark points
+                msg = landmark_q.get()
+                raw_pts = None
+                for tensor in msg.getRaw().tensors:
+                    if tensor.name == 'StatefulPartitionedCall/strided_slice_2/Split.0':
+                        raw_pts = np.array(msg.getLayerFp16(tensor.name))
+                if raw_pts is None:
+                    continue
 
-    def should_run(self):
-        return True if camera else self.cap.isOpened()
+                # Convert coordinate points to full frame pixels
+                face_bbox = self.bbox_q.get()
+                y_size = face_bbox[3] - face_bbox[1]
+                x_size = face_bbox[2] - face_bbox[0]
+                bounds = np.array([x_size, y_size] * (raw_pts.size // 2))
+                raw_pts = np.clip(raw_pts, 0, 1)
+                pts = (raw_pts * bounds).astype(int)
+                origin = np.array([face_bbox[0], face_bbox[1]] * (pts.size // 2))
+                pts = pts + origin
 
-    def get_frame(self, retries=0):
-        if camera:
-            rgb_output = self.cam_out.get()
-            return True, np.array(rgb_output.getData()).reshape((3, rgb_output.getHeight(), rgb_output.getWidth())).transpose(1, 2, 0).astype(np.uint8)
-        else:
-            read_correctly, new_frame = self.cap.read()
-            if not read_correctly or new_frame is None:
-                if retries < 5:
-                    return self.get_frame(retries+1)
-                else:
-                    print("Source closed, terminating...")
-                    return False, None
-            else:
-                return read_correctly, new_frame
-    
+                # Filter points to list of 13 key facial landmarks
+                key_pts = self.key_landmarks(pts)
+
+                # Calculate head pose vector from landmark points
+                unit_pts, euler_angle, pitch, yaw, roll = self.head_pose(key_pts)
+
+                # Store pose vector and angles for current timestamp
+                self.meta[self.timestamp]['euler_angle'] = euler_angle
+                self.meta[self.timestamp]['pitch'] = pitch
+                self.meta[self.timestamp]['yaw'] = yaw
+                self.meta[self.timestamp]['roll'] = roll
+
+                # Queue up for preview window display
+                if self.debug:
+                    self.face_q.put(face_bbox)
+                    self.mark_q.put(key_pts)
+                    self.unit_q.put(unit_pts)
+
+    @staticmethod
+    def key_landmarks(pts):
+        # Return key landmark points needed for pose estimation
+        key_pts = [(pts[34], pts[35]),  # 17 Left eyebrow upper left corner
+                   (pts[42], pts[43]),  # 21 Left eyebrow right corner
+                   (pts[44], pts[45]),  # 22 Right eyebrow upper left corner
+                   (pts[52], pts[53]),  # 26 Right eyebrow upper right corner
+                   (pts[72], pts[73]),  # 36 Left eye upper left corner
+                   (pts[78], pts[79]),  # 39 Left eye upper right corner
+                   (pts[84], pts[85]),  # 42 Right eye upper left corner
+                   (pts[90], pts[91]),  # 45 Upper right corner of the right eye
+                   (pts[62], pts[63]),  # 31 Upper left corner of the nose
+                   (pts[70], pts[71]),  # 35 Upper right corner of the nose
+                   (pts[96], pts[97]),  # 48 Upper left corner
+                   (pts[108], pts[109]),  # 54 Upper right corner of the mouth
+                   (pts[114], pts[115]),  # 57 Lower central corner of the mouth
+                   (pts[16], pts[17])]  # 8 Chin corner
+        return key_pts
+
+    def head_pose(self, key_pts):
+        # Fill in the 2D reference point, follow https://ibug.doc.ic.ac.uk/resources/300-W/
+        # reprojectdst, _, pitch, yaw, roll = get_head_pose(np.array(self.hand_points))
+
+        # World Coordinate System (UVW) 3D reference points
+        # Face model reference http://aifi.isr.uc.pt/Downloads/OpenGL/glAnthropometric3DModel.cpp
+        ref_pts = np.float32([[6.825897, 6.760612, 4.402142],  # Upper left corner of left eyebrow
+                              [1.330353, 7.122144, 6.903745],  # Left eyebrow right corner
+                              [-1.330353, 7.122144, 6.903745],  # Right eyebrow left corner
+                              [-6.825897, 6.760612, 4.402142],  # Upper right corner of right eyebrow
+                              [5.311432, 5.485328, 3.987654],  # Upper left corner of left eye
+                              [1.789930, 5.393625, 4.413414],  # Upper right corner of left eye
+                              [-1.789930, 5.393625, 4.413414],  # Upper left corner of right eye
+                              [-5.311432, 5.485328, 3.987654],  # Upper right corner of right eye
+                              [2.005628, 1.409845, 6.165652],  # Upper left corner of nose
+                              [-2.005628, 1.409845, 6.165652],  # Upper right corner of nose
+                              [2.774015, -2.080775, 5.048531],  # Upper left corner of mouth
+                              [-2.774015, -2.080775, 5.048531],  # Upper right corner of mouth
+                              [0.000000, -3.116408, 6.097667],  # Lower corner of mouth
+                              [0.000000, -7.415691, 4.070434]])  # Chin angle
+
+        # Calculate the rotation and translation vectors
+        img_pts = np.float32(key_pts)
+        _, rotation, translation = cv2.solvePnP(ref_pts, img_pts, self.K, self.D)
+
+        # Project unit vectors to visually display head pose
+        length = 10  # TODO make vector length sizing dynamic
+        unit_pts = length * np.float32([(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)])
+        unit_pts, _ = cv2.projectPoints(unit_pts, rotation, translation, self.K, self.D)
+        unit_pts = list(map(tuple, unit_pts.reshape(8, 2)))
+
+        # Calculate Euler angle
+        rotation_v = cv2.Rodrigues(rotation)[0]  # convert rotation matrix to a rotation vector
+        pose_matrix = cv2.hconcat((rotation_v, translation))
+        euler_angle = cv2.decomposeProjectionMatrix(pose_matrix)[-1]
+
+        # Convert Euler angle into pitch, yaw and roll
+        pitch, yaw, roll = [math.radians(angle) for angle in euler_angle]
+        pitch = math.degrees(math.asin(math.sin(pitch)))
+        roll = -math.degrees(math.asin(math.sin(roll)))
+        yaw = math.degrees(math.asin(math.sin(yaw)))
+
+        return unit_pts, euler_angle, pitch, yaw, roll
+
     def run(self):
-        self.threads = [
-            threading.Thread(target=self.run_face, daemon=True),
-            threading.Thread(target=self.run_land68, daemon=True)
-        ]
+        # Start neural network threads
+        self.threads = [threading.Thread(target=self.run_face_detection, daemon=True),
+                        threading.Thread(target=self.run_face_landmarking, daemon=True)]
         for thread in self.threads:
             thread.start()
-        while self.should_run():
-            read_correctly, new_frame = self.get_frame()
-            if not read_correctly:
-                break
-            self.fps.update()
-            self.frame = new_frame
-            self.debug_frame = self.frame.copy()
-            if not camera:
-                nn_data = depthai.NNData()
-                nn_data.setLayer("data", to_planar(self.frame, (300, 300)))
-                self.face_in.send(nn_data)
-            if debug:
-                if self.results.qsize() > 0 and self.face_bboxs.qsize() > 0:
-                    try:
-                        for i in range(self.results.qsize()):
-                            face_bbox = self.face_bboxs.get()
-                            result = self.results.get()
-                            bbox = frame_norm(self.frame, self.bboxes[i])
-                            self.draw_bbox(bbox, (0,255,0))
-                            self.hand_points = []
-                            # 17 Left eyebrow upper left corner/21 Left eyebrow right corner/22 Right eyebrow upper left corner/26 Right eyebrow upper right corner/36 Left eye upper left corner/39 Left eye upper right corner/42 Right eye upper left corner/
-                            # 45 Upper right corner of the right eye/31 Upper left corner of the nose/35 Upper right corner of the nose/48 Upper left corner/54 Upper right corner of the mouth/57 Lower central corner of the mouth/8 Chin corner
-                            # The coordinates are two points, so you have to multiply by 2.
-                            self.hand_points.append((result[34]+face_bbox[0],result[35]+face_bbox[1]))
-                            self.hand_points.append((result[42]+face_bbox[0],result[43]+face_bbox[1]))
-                            self.hand_points.append((result[44]+face_bbox[0],result[45]+face_bbox[1]))
-                            self.hand_points.append((result[52]+face_bbox[0],result[53]+face_bbox[1]))
-                            self.hand_points.append((result[72]+face_bbox[0],result[73]+face_bbox[1]))
-                            self.hand_points.append((result[78]+face_bbox[0],result[79]+face_bbox[1]))
-                            self.hand_points.append((result[84]+face_bbox[0],result[85]+face_bbox[1]))
-                            self.hand_points.append((result[90]+face_bbox[0],result[91]+face_bbox[1]))
-                            self.hand_points.append((result[62]+face_bbox[0],result[63]+face_bbox[1]))
-                            self.hand_points.append((result[70]+face_bbox[0],result[71]+face_bbox[1]))
-                            self.hand_points.append((result[96]+face_bbox[0],result[97]+face_bbox[1]))
-                            self.hand_points.append((result[108]+face_bbox[0],result[109]+face_bbox[1]))
-                            self.hand_points.append((result[114]+face_bbox[0],result[115]+face_bbox[1]))
-                            self.hand_points.append((result[16]+face_bbox[0],result[17]+face_bbox[1]))
-                            for i in self.hand_points:
-                                cv2.circle(self.debug_frame,(i[0],i[1]),2,(255,0,0),thickness=1,lineType=8,shift=0)
-                            reprojectdst, _, pitch, yaw, roll = get_head_pose(np.array(self.hand_points))
 
-                            """
-                            pitch > 0 Head down, < 0 look up
-                            yaw > 0 Turn right < 0 Turn left
-                            roll > 0 Tilt right, < 0 Tilt left
-                            """
-                            cv2.putText(self.debug_frame,"pitch:{:.2f}, yaw:{:.2f}, roll:{:.2f}".format(pitch,yaw,roll),(face_bbox[0]-30,face_bbox[1]-30),cv2.FONT_HERSHEY_COMPLEX,0.45,(255,0,0))  
-                            
-                            hand_attitude = np.array([abs(pitch),abs(yaw),abs(roll)])
-                            max_index = np.argmax(hand_attitude)
-                            if max_index == 0:
-                                if pitch > 0:
-                                    cv2.putText(self.debug_frame,"Head down", (face_bbox[0],face_bbox[1]-10),cv2.FONT_HERSHEY_COMPLEX,0.5,(235,10,10))
-                                else:
-                                    cv2.putText(self.debug_frame,"look up", (face_bbox[0],face_bbox[1]-10),cv2.FONT_HERSHEY_COMPLEX,0.5,(235,10,10))
-                            elif max_index == 1:
-                                if yaw > 0:
-                                    cv2.putText(self.debug_frame,"Turn right", (face_bbox[0],face_bbox[1]-10),cv2.FONT_HERSHEY_COMPLEX,0.5,(235,10,10))
-                                else:
-                                    cv2.putText(self.debug_frame,"Turn left", (face_bbox[0],face_bbox[1]-10),cv2.FONT_HERSHEY_COMPLEX,0.5,(235,10,10))
-                            elif max_index == 2:
-                                if roll > 0:
-                                    cv2.putText(self.debug_frame,"Tilt right", (face_bbox[0],face_bbox[1]-10),cv2.FONT_HERSHEY_COMPLEX,0.5,(235,10,10))
-                                else:
-                                    cv2.putText(self.debug_frame,"Tilt left", (face_bbox[0],face_bbox[1]-10),cv2.FONT_HERSHEY_COMPLEX,0.5,(235,10,10))
-                            # Draw a cube with 12 axes
-                            line_pairs = [[0, 1], [1, 2], [2, 3], [3, 0],
-                                        [4, 5], [5, 6], [6, 7], [7, 4],
-                                        [0, 4], [1, 5], [2, 6], [3, 7]]
-                            for start, end in line_pairs:
-                                cv2.line(self.debug_frame, reprojectdst[start], reprojectdst[end], (0, 0, 255))
-                    except:
-                        pass
-                if camera:
-                    cv2.imshow("Camera view", self.debug_frame)
-                else:
-                    aspect_ratio = self.frame.shape[1] / self.frame.shape[0]
-                    cv2.imshow("Video view", cv2.resize(self.debug_frame, (int(900),  int(900 / aspect_ratio))))
-                if cv2.waitKey(1) == ord('q'):
-                    cv2.destroyAllWindows()
-                    break
+        # Run loop
+        with open(self.store / 'session.h265', 'wb') as video:
+            while self.running:
+                # Grab frame for preview and inference
+                self.grab_frame()
 
-        self.fps.stop()
-        print("FPS：{:.2f}".format(self.fps.fps()))
-        if not camera:
-            self.cap.release()
+                # Save queued raw frames to video file
+                try:
+                    self.video.get().getData().tofile(video)
+                except RuntimeError:
+                    pass
+
+                # Update preview window
+                if self.debug:
+                    debug_frame = self.frame.copy()
+                    if self.face_q.qsize() and self.mark_q.qsize() and self.unit_q.qsize():
+                        for i in range(self.face_q.qsize()):
+                            face_bbox = self.face_q.get()
+                            key_pts = self.mark_q.get()
+                            unit_pts = self.unit_q.get()
+
+                            # Draw bounding box
+                            cv2.rectangle(debug_frame,
+                                          (face_bbox[0], face_bbox[1]),
+                                          (face_bbox[2], face_bbox[3]),
+                                          color=(0, 255, 0), thickness=2)
+
+                            # Draw landmark points
+                            for pt in key_pts:
+                                cv2.circle(debug_frame, pt,
+                                           radius=2, color=(255, 0, 0), thickness=1)
+
+                            # Draw unit vectors
+                            origin = unit_pts[0]
+                            colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]
+                            for pt, color in zip(unit_pts[1:], colors):
+                                cv2.line(debug_frame, origin, pt, color=color, thickness=2)
+
+                            # Add text to display angles
+                            meta = self.meta[self.timestamp]
+                            angles = [meta['pitch'], meta['yaw'], meta['roll']]
+                            cv2.putText(debug_frame,
+                                        "pitch:{:.2f}, yaw:{:.2f}, roll:{:.2f}".format(*angles),
+                                        (face_bbox[0] - 30, face_bbox[1] - 30),
+                                        fontFace=cv2.FONT_HERSHEY_COMPLEX,
+                                        fontScale=0.45, color=(255, 0, 0))
+
+                    cv2.imshow("Preview", debug_frame)
+                    if cv2.waitKey(1) == ord('q'):
+                        cv2.destroyAllWindows()
+                        self.running = False
+                # TODO add non debug break option
+
+        self.finish()
+        self.write_json()
+        self.upload_data()
+        print('Session ended.')
+
+    def finish(self):
+        if self.debug:
+            self.fps.stop()
+            print(f"Average FPS：{self.fps.fps():.2f}")
+
+        # Close all streams and stop inference
+        print('Closing camera pipeline...')
         cv2.destroyAllWindows()
         self.running = False
         for thread in self.threads:
@@ -290,5 +386,15 @@ class Main:
             if thread.is_alive():
                 break
 
+    def write_json(self):
+        with open(self.store / 'meta.txt', 'w') as file:
+            json.dump(self.meta, file)
+
+    def upload_data(self):
+        # TODO implement cloud upload
+        pass
+
+
 if __name__ == '__main__':
-    Main().run()
+    sess = Session()
+    # sess.run()

@@ -4,6 +4,7 @@
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/ref/deep-head-pose" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/ref/depthai" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/ref/depthai-experiments" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/ref/depthai-python" vcs="Git" />
   </component>
 </project>
