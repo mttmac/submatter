@@ -92,11 +92,11 @@ class Session:
         # Init neural net inference queues
         self.frame = None
         self.timestamp = None
-        self.bboxes = []
         self.bbox_q = Queue()
         self.face_q = Queue()
         self.mark_q = Queue()
         self.unit_q = Queue()
+        self.pose_q = Queue()
 
         # Init camera pixel coordinate system (xy): camera eigen and distortion coefficients
         # Camera coordinate system (XYZ): camera internal matrix [fx, 0, cx; 0, fy, cy; 0, 0, 1]
@@ -160,8 +160,8 @@ class Session:
         return pipeline
 
     def elapsed_ms(self, timedelta):
-        ms = ((timedelta.days * 24 * 60 * 60 + timedelta.seconds) * 1000 +
-              (timedelta.microseconds / 1000))
+        ms = round((timedelta.days * 24 * 60 * 60 + timedelta.seconds) * 1000 +
+                   (timedelta.microseconds / 1000))
         if self.stream_start is None:
             self.stream_start = ms
         return ms - self.stream_start
@@ -187,11 +187,11 @@ class Session:
                 continue
             bboxes = np.array(msg.getFirstLayerFp16())
             bboxes = bboxes.reshape((bboxes.size // 7, 7))
-            self.bboxes = bboxes[bboxes[:, 2] > 0.7][:, 3:7]
+            bboxes = bboxes[bboxes[:, 2] > 0.7][:, 3:7]
 
             # TODO filter to track one bbox only or track individuals
             # TODO add a confidence filter for landmarking as well
-            for raw_bbox in self.bboxes:
+            for raw_bbox in bboxes:
                 # Convert bounding box coordinates to pixels
                 y_size, x_size = self.frame.shape[:2]
                 bounds = np.array([x_size, y_size] * (raw_bbox.size // 2))
@@ -205,7 +205,8 @@ class Session:
                 bbox_frame = self.frame[bbox[1]:bbox[3], bbox[0]:bbox[2]]
                 bbox_data = cv2.resize(bbox_frame, (160, 160)).transpose(2, 0, 1)
                 bbox_data = bbox_data.flatten().tolist()
-                tensor = dai.NNData().setLayer('data', bbox_data)
+                tensor = dai.NNData()
+                tensor.setLayer('data', bbox_data)
                 landmark_qin.send(tensor)
 
                 # Queue up bounding box for landmarking reference
@@ -215,7 +216,7 @@ class Session:
         landmark_q = self.device.getOutputQueue('landmark', maxSize=4, blocking=False)
 
         while self.running:
-            while len(self.bboxes):
+            while self.bbox_q.qsize():
                 # Retrieve landmark points
                 msg = landmark_q.tryGet()
                 if msg is None:
@@ -240,9 +241,9 @@ class Session:
 
                 # Calculate head pose vector from landmark points
                 unit_pts, euler_angle, pitch, yaw, roll = self.head_pose(key_pts)
+                angles = [pitch, yaw, roll]
 
                 # Store pose vector and angles for current timestamp
-                self.meta[self.timestamp]['euler_angle'] = euler_angle
                 self.meta[self.timestamp]['pitch'] = pitch
                 self.meta[self.timestamp]['yaw'] = yaw
                 self.meta[self.timestamp]['roll'] = roll
@@ -252,6 +253,7 @@ class Session:
                     self.face_q.put(face_bbox)
                     self.mark_q.put(key_pts)
                     self.unit_q.put(unit_pts)
+                    self.pose_q.put(angles)
 
     @staticmethod
     def key_landmarks(pts):
@@ -301,7 +303,7 @@ class Session:
         length = 10  # TODO make vector length sizing dynamic
         unit_pts = length * np.float32([(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)])
         unit_pts, _ = cv2.projectPoints(unit_pts, rotation, translation, self.K, self.D)
-        unit_pts = list(map(tuple, unit_pts.reshape(8, 2)))
+        unit_pts = list(map(tuple, unit_pts.reshape(4, 2)))
 
         # Calculate Euler angle
         rotation_v = cv2.Rodrigues(rotation)[0]  # convert rotation matrix to a rotation vector
@@ -342,12 +344,13 @@ class Session:
                             face_bbox = self.face_q.get()
                             key_pts = self.mark_q.get()
                             unit_pts = self.unit_q.get()
+                            angles = self.pose_q.get()
 
                             # Draw bounding box
                             cv2.rectangle(debug_frame,
                                           (face_bbox[0], face_bbox[1]),
                                           (face_bbox[2], face_bbox[3]),
-                                          color=(0, 255, 0), thickness=2)
+                                          color=(0, 255, 0), thickness=1)
 
                             # Draw landmark points
                             for pt in key_pts:
@@ -358,11 +361,9 @@ class Session:
                             origin = unit_pts[0]
                             colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]
                             for pt, color in zip(unit_pts[1:], colors):
-                                cv2.line(debug_frame, origin, pt, color=color, thickness=2)
+                                cv2.line(debug_frame, origin, pt, color=color, thickness=1)
 
                             # Add text to display angles
-                            meta = self.meta[self.timestamp]
-                            angles = [meta['pitch'], meta['yaw'], meta['roll']]
                             cv2.putText(debug_frame,
                                         "pitch:{:.2f}, yaw:{:.2f}, roll:{:.2f}".format(*angles),
                                         (face_bbox[0] - 30, face_bbox[1] - 30),
@@ -387,23 +388,31 @@ class Session:
             print(f"Average FPS：{self.fps.fps():.2f}")
 
         # Close all streams and stop inference
-        print('Closing camera pipeline...')
-        cv2.destroyAllWindows()
-        self.running = False
         for thread in self.threads:
             thread.join(2)
             if thread.is_alive():
                 break
+        print('Camera stream ended.')
 
     def write_json(self):
+        # Remove empty data points
+        meta = {}
+        for key, val in self.meta.items():
+            if val:
+                meta[key] = val
+        # Dump to file
         with open(self.store / 'meta.txt', 'w') as file:
-            json.dump(self.meta, file)
-        print('Meta JSON file created.')
+            json.dump(meta, file)
+        print('JSON data file created.')
 
     def convert_video(self):
         if self.debug:
-            ffmpeg.input(self.store / 'session.h265').output(self.store / 'session.mp4').run()
-            print('Video file converted to mp4.')
+            print('Converting video file...')
+            (ffmpeg
+             .input(str(self.store / 'session.h265'))
+             .output(str(self.store / 'session.mp4'))
+             .run())
+            print('Video file converted to MP4.')
 
     def upload_data(self):
         # TODO implement cloud upload
