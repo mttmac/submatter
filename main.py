@@ -12,16 +12,24 @@ Based on https://github.com/luxonis/depthai-experiments gen2-head-posture-detect
 
 Trained neural networks sourced from OpenVino toolkit:
 face-detection-retail-0004 (SSD face detection)
-Unknown blob!!! facial-landmarks-35-adas-0002 (CNN facial landmarks estimation)
+facial-landmarks-35-adas-0002 (CNN facial landmarks estimation) Unknown blob!!!
+
 Future:
 head-pose-estimation-adas-0001 (CNN head pose estimation)
+hopenet-lite (CNN head pose estimation)
 gaze-estimation-adas-0002 (VGG eye gaze estimation)
 """
-# TODO use disparity depth calcualtion to improve accuracy of landmarking
+
+# TODO sync up bbox and angle meta better to reduce amount of NaN
+# TODO use disparity depth calculation to add 3D space coordinate for head bbox
+# TODO add NN head pose algorithm as variant
+# TODO add hopelite head pose as variant (openvino for blob)
+# TODO add eye gaze estimation
 # TODO add rectified disparity video file saving
-# TODO Upgrade face detection to 0005
-# TODO implement a known facial landmarks estimator
-# TODO add tracking to faces for consistency
+# TODO upgrade face detection to 0005
+# TODO filter to track one bbox only or track individuals
+# TODO add a confidence filter for head pose as well
+# TODO add non debug mode start and stop control (command line over ssh)
 
 
 import datetime
@@ -61,9 +69,10 @@ def timer(function):
 
 
 class Session:
-    def __init__(self, debug=True):
+    def __init__(self, debug=False, convert=False):
         print('Starting session...')
         self.debug = debug
+        self.convert = convert
 
         # Init local storage
         self.label = f"session-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
@@ -189,8 +198,6 @@ class Session:
             bboxes = bboxes.reshape((bboxes.size // 7, 7))
             bboxes = bboxes[bboxes[:, 2] > 0.7][:, 3:7]
 
-            # TODO filter to track one bbox only or track individuals
-            # TODO add a confidence filter for landmarking as well
             for raw_bbox in bboxes:
                 # Convert bounding box coordinates to pixels
                 y_size, x_size = self.frame.shape[:2]
@@ -240,7 +247,7 @@ class Session:
                 key_pts = self.key_landmarks(pts)
 
                 # Calculate head pose vector from landmark points
-                unit_pts, euler_angle, pitch, yaw, roll = self.head_pose(key_pts)
+                unit_pts, pitch, yaw, roll = self.head_pose(key_pts)
                 angles = [pitch, yaw, roll]
 
                 # Store pose vector and angles for current timestamp
@@ -300,8 +307,8 @@ class Session:
         _, rotation, translation = cv2.solvePnP(ref_pts, img_pts, self.K, self.D)
 
         # Project unit vectors to visually display head pose
-        length = 10  # TODO make vector length sizing dynamic
-        unit_pts = length * np.float32([(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)])
+        length = 10  # non dynamic
+        unit_pts = length * np.float32([(0, 0, 0), (1, 0, 0), (0, -1, 0), (0, 0, 1)])
         unit_pts, _ = cv2.projectPoints(unit_pts, rotation, translation, self.K, self.D)
         unit_pts = list(map(tuple, unit_pts.reshape(4, 2)))
 
@@ -316,7 +323,7 @@ class Session:
         roll = -math.degrees(math.asin(math.sin(roll)))
         yaw = math.degrees(math.asin(math.sin(yaw)))
 
-        return unit_pts, euler_angle, pitch, yaw, roll
+        return unit_pts, pitch, yaw, roll
 
     def run(self):
         # Start neural network threads
@@ -374,7 +381,6 @@ class Session:
                     if cv2.waitKey(1) == ord('q'):
                         cv2.destroyAllWindows()
                         self.running = False
-                # TODO add non debug break option
 
         self.finish()
         self.write_json()
@@ -406,7 +412,7 @@ class Session:
         print('JSON data file created.')
 
     def convert_video(self):
-        if self.debug:
+        if self.debug and self.convert:
             print('Converting video file...')
             (ffmpeg
              .input(str(self.store / 'session.h265'))
@@ -416,9 +422,11 @@ class Session:
 
     def upload_data(self):
         # TODO implement cloud upload
+        # TODO chunk into one minute files
+        # TODO delete local folder after confirmed upload
         pass
 
 
 if __name__ == '__main__':
-    sess = Session()
+    sess = Session(debug=True, convert=True)
     sess.run()
