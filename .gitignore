@@ -128,9 +128,9 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# Reference repos or trained models
+# Reference repos or sessions
 ref/
-models/
+sessions/
 
 # Large video files
 *.h264

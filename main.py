@@ -5,31 +5,32 @@ Submatter head movement tracker
 Matt MacDonald, Subhash Talluri 2021
 
 Main camera controller
-Starts a video stream, detects head pose, extracts vectors and logs in json for upload
-Stores raw video and disparity for subsequent analysis on the cloud
+1. Starts a video stream, detects head pose, extracts vectors and logs in json for upload
+2. Shows annotated preview stream
+3. Stores raw video and disparity for subsequent analysis on the cloud
 
-Based on https://github.com/luxonis/depthai-experiments gen2-head-posture-detection experiment
+Pre-Trained Models
+__________________
+Face detection and identification:
+OpenVINO model zoo - https://docs.openvinotoolkit.org/latest/omz_models_group_intel.html
+face-detection-retail-0005
+face-reidentification-retail-0095
 
-Trained neural networks sourced from OpenVino toolkit:
-face-detection-retail-0004 (SSD face detection)
-facial-landmarks-35-adas-0002 (CNN facial landmarks estimation) Unknown blob!!!
+Head pose estimation:
+Hopenet-lite - https://github.com/OverEuro/deep-head-pose-lite
 
-Future:
-head-pose-estimation-adas-0001 (CNN head pose estimation)
-hopenet-lite (CNN head pose estimation)
-gaze-estimation-adas-0002 (VGG eye gaze estimation)
+Future - Eye gaze estimation:
+gaze-estimation-adas-0002
 """
 
+# TODO add hopelite head pose (openvino for blob)
+# TODO add non debug mode start and stop control (command line over ssh)
 # TODO sync up bbox and angle meta better to reduce amount of NaN
 # TODO use disparity depth calculation to add 3D space coordinate for head bbox
-# TODO add NN head pose algorithm as variant
-# TODO add hopelite head pose as variant (openvino for blob)
-# TODO add eye gaze estimation
-# TODO add rectified disparity video file saving
-# TODO upgrade face detection to 0005
 # TODO filter to track one bbox only or track individuals
-# TODO add a confidence filter for head pose as well
-# TODO add non debug mode start and stop control (command line over ssh)
+# TODO add a confidence filter for head pose and store in json meta
+# TODO add eye gaze estimation
+# TODO optional: add rectified disparity video file saving
 
 
 import datetime
@@ -76,7 +77,7 @@ class Session:
 
         # Init local storage
         self.label = f"session-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
-        self.store = Path('sessions', self.label).resolve().absolute()
+        self.store = Path('sessions', self.label).resolve()
         os.makedirs(str(self.store))
         self.meta = {}
 
@@ -107,6 +108,7 @@ class Session:
         self.unit_q = Queue()
         self.pose_q = Queue()
 
+        # TODO: delete
         # Init camera pixel coordinate system (xy): camera eigen and distortion coefficients
         # Camera coordinate system (XYZ): camera internal matrix [fx, 0, cx; 0, fy, cy; 0, 0, 1]
         self.K = np.float32([6.5308391993466671e+002, 0.0, 3.1950000000000000e+002,
@@ -140,13 +142,13 @@ class Session:
         # Setup preview stream for display and inference
         cam_xpre = pipeline.createXLinkOut()
         cam_xpre.setStreamName("cam_preview")
-        cam.setPreviewSize(300, 300)
+        cam.setPreviewSize(320, 320)  # TODO: net size needed or cropped?
         cam.preview.link(cam_xpre.input)
         print('Video streams created.')
 
         # Setup neural networks for inference
         models = {'detect': 'face-detection-retail-0004_openvino_2020_1_4shave.blob',
-                  'landmark': 'face_landmark_160x160_openvino_2020_1_4shave.blob'}
+                  'pose': 'face_landmark_160x160_openvino_2020_1_4shave.blob'}
         first_model = 'detect'
         for name, blob in models.items():
             blob_path = Path('models', blob).resolve().absolute()
