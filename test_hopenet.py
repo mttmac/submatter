@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from PIL import Image
 from pathlib import Path
 import sys
-sys.path.append(Path('ref/deep-head-pose-lite').resolve())
+sys.path.insert(1, str(Path('ref/deep-head-pose-lite/').resolve()))
 import stable_hopenetlite
 
 model = stable_hopenetlite.shufflenet_v2_x1_0()
@@ -15,12 +15,14 @@ model.eval()
 
 samples = []
 for i in range(3):
-    samples.append(Path(f'samples/face{i}.jpeg'))
+    samples.append(Path(f'samples/224/face{i}.jpeg'))
 
 idx_tensor = torch.FloatTensor(range(66))
+transform = transforms.Compose([transforms.Resize(224), transforms.ToTensor(),
+                                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
 for s in samples:
     im = Image.open(s)
-    img = transforms.ToTensor(im)
+    img = transform(im)
     img = torch.unsqueeze(img, 0)
 
     yaw, pitch, roll = model(img)

@@ -2,7 +2,9 @@
 <project version="4">
   <component name="VcsDirectoryMappings">
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/ref/AFARtoolbox" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/ref/deep-head-pose" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/ref/deep-head-pose-lite" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/ref/depthai" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/ref/depthai-experiments" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/ref/depthai-python" vcs="Git" />
