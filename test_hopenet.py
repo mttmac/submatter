@@ -7,6 +7,11 @@ import sys
 sys.path.insert(1, str(Path('ref/deep-head-pose-lite/').resolve()))
 import stable_hopenetlite
 
+def softmax_temperature(tensor, temperature):
+    result = torch.exp(tensor / temperature)
+    result = torch.div(result, torch.sum(result, 1).unsqueeze(1).expand_as(result))
+    return result
+
 model = stable_hopenetlite.shufflenet_v2_x1_0()
 net_path = Path('ref/deep-head-pose-lite/model/shuff_epoch_120.pkl')
 net = torch.load(net_path, map_location=torch.device('cpu'))
@@ -27,9 +32,9 @@ for s in samples:
 
     yaw, pitch, roll = model(img)
 
-    yaw_predicted = F.softmax(yaw, dim=1)
-    pitch_predicted = F.softmax(pitch, dim=1)
-    roll_predicted = F.softmax(roll, dim=1)
+    yaw_predicted = F.softmax(yaw.data, dim=1)
+    pitch_predicted = F.softmax(pitch.data, dim=1)
+    roll_predicted = F.softmax(roll.data, dim=1)
 
     yaw_predicted = torch.sum(yaw_predicted.data[0] * idx_tensor) * 3 - 99
     pitch_predicted = torch.sum(pitch_predicted.data[0] * idx_tensor) * 3 - 99

@@ -17,13 +17,13 @@ torch.onnx.export(model, (dummy_input, ), Path('models/hopenet-lite/shuff_epoch_
 # Command line macOS
 """
 cd /opt/intel/openvino_2021.4.582/deployment_tools/model_optimizer
-python mo.py --input_model ~/repos/submatter/models/hopenet-lite/shuff_epoch_120-224x224.onnx --output_dir ~/repos/submatter/models/hopenet-lite/
+python mo.py --input_model ~/repos/submatter/models/hopenet-lite/shuff_epoch_120-224x224.onnx --output_dir ~/repos/submatter/models/hopenet-lite/ --model_name hopenet-fp16-224x224 --data_type FP16
 
 Model Optimizer arguments:
 Common parameters:
 	- Path to the Input Model: 	/Users/mattmacdonald/repos/submatter/models/hopenet-lite/shuff_epoch_120-224x224.onnx
 	- Path for generated IR: 	/Users/mattmacdonald/repos/submatter/models/hopenet-lite/
-	- IR output name: 	shuff_epoch_120-224x224
+	- IR output name: 	hopenet-fp16-224x224
 	- Log level: 	ERROR
 	- Batch: 	Not specified, inherited from the model
 	- Input layers: 	Not specified, inherited from the model
@@ -32,7 +32,7 @@ Common parameters:
 	- Mean values: 	Not specified
 	- Scale values: 	Not specified
 	- Scale factor: 	Not specified
-	- Precision of IR: 	FP32
+	- Precision of IR: 	FP16
 	- Enable fusing: 	True
 	- Enable grouped convolutions fusing: 	True
 	- Move mean values to preprocess section: 	None
@@ -42,10 +42,10 @@ ONNX specific parameters:
 Inference Engine version: 	2021.4.0-3839-cd81789d294-releases/2021/4
 Model Optimizer version: 	2021.4.0-3839-cd81789d294-releases/2021/4
 [ SUCCESS ] Generated IR version 10 model.
-[ SUCCESS ] XML file: /Users/mattmacdonald/repos/submatter/models/hopenet-lite/shuff_epoch_120-224x224.xml
-[ SUCCESS ] BIN file: /Users/mattmacdonald/repos/submatter/models/hopenet-lite/shuff_epoch_120-224x224.bin
-[ SUCCESS ] Total execution time: 27.43 seconds.
-[ SUCCESS ] Memory consumed: 108 MB.
+[ SUCCESS ] XML file: /Users/mattmacdonald/repos/submatter/models/hopenet-lite/hopenet-fp16-224x224.xml
+[ SUCCESS ] BIN file: /Users/mattmacdonald/repos/submatter/models/hopenet-lite/hopenet-fp16-224x224.bin
+[ SUCCESS ] Total execution time: 29.99 seconds.
+[ SUCCESS ] Memory consumed: 97 MB.
 """
 
 # To understand model architecture better use torchinfo

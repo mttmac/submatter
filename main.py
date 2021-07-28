@@ -35,6 +35,8 @@ gaze-estimation-adas-0002
 
 
 import os
+import glob
+import shutil
 import time
 import datetime
 from pathlib import Path
@@ -47,11 +49,13 @@ import queue
 import threading
 import json
 
-from math import cos, sin, degrees
 import cv2
 import numpy as np
 import depthai as dai
 
+from math import cos, sin, degrees
+from scipy.spatial.distance import cosine
+from scipy.special import softmax
 from imutils.video import FPS
 
 # Set arguments for running from CLI
@@ -62,19 +66,26 @@ parser.add_argument('-vid', '--video', type=str,
                     help="Path to video file to be used for inference")
 parser.add_argument('-min', '--minutes', type=int, default=2,
                     help="Session time out in minutes (default 2 mins)")
+parser.add_argument('-ann', '--annotate', type=str,
+                    help="Save annotated preview video")
 parser.add_argument('-sav', '--save', action="store_true",
                     help="Save raw source video in 1080P when using OAK-D")
 parser.add_argument('-deb', '--debug', action="store_true",
                     help="Enter debug mode to display frames per second")
+parser.add_argument('-adv', '--advanced', action="store_true",
+                    help="Run advanced face id neural net instead of naive method")
 
 args = parser.parse_args()
 debug_mode = args.debug
 show_preview = args.preview
 save_video = args.save
+save_annotated = args.annotate
+advanced_ffid = args.advanced
 use_camera = not args.video
 if not use_camera:
     source = Path(args.video).resolve().absolute()
 timeout = args.minutes
+
 
 # Define monitoring class for treatment sessions
 class Session:
@@ -85,28 +96,37 @@ class Session:
         self.label = f"session-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
         self.store = Path('sessions', self.label).resolve().absolute()
         os.makedirs(str(self.store))
-        self.data = {}
-        # TODO upload folder and old file handling
+
+        # Prune oldest sessions to maximum number allowed
+        sessions = sorted([Path(f) for f in glob.glob('sessions/session-*/')])
+        max_sessions = 5
+        while len(sessions) > max_sessions:
+            oldest = sessions.pop(0)
+            shutil.rmtree(oldest)
 
         # Init neural network models
-        self.models = {'face_detect': 'face-detection-retail-0005.blob',
-                       'face_id': 'face-reidentification-retail-0095.blob',
-                       'head_pose': 'hopenet-lite.blob'}
+        self.models = {'face_detect': 'face-detection-retail-0005-fp16-300x300-6shave.blob',
+                       'face_id': 'face-reidentification-retail-0095-fp16-128x128-6shave.blob',
+                       'head_pose': 'hopenet-fp16-224x224-6shave-ipFP16.blob'}
         self.model_sizes = {'face_detect': (300, 300),
                             'face_id': (128, 128),
                             'head_pose': (224, 224)}
 
         # Init camera
         self.preview_size = (600, 600)  # must be square aspect ratio for nnets
+        if save_annotated:
+            assert (self.preview_size[0] % 8 == 0) and (self.preview_size[1] % 8 == 0), \
+                "Preview size must be multiple of 8 for video encoder."
         self.pipeline = self.create_pipeline()
         self.device = dai.Device(self.pipeline)
         print("Starting camera pipeline...")
         self.running = self.device.startPipeline()
 
         # Init streaming
-        self.encoder = self.device.getOutputQueue('annotated_in', maxSize=30, blocking=True)
-        self.annotated = self.device.getOutputQueue('annotated_out', maxSize=30, blocking=True)
-        self.a_file = open(self.store / 'annotated.h265', 'wb')
+        if save_annotated:
+            self.encoder = self.device.getInputQueue('annotated_in', maxSize=30, blocking=True)
+            self.annotated = self.device.getOutputQueue('annotated_out', maxSize=30, blocking=True)
+            self.a_file = open(self.store / 'annotated.h265', 'wb')
         if save_video:
             self.video = self.device.getOutputQueue('video_out', maxSize=30, blocking=True)
             self.v_file = open(self.store / 'video.h265', 'wb')
@@ -117,25 +137,34 @@ class Session:
 
         # Init neural net inference queues
         self.face_q = self.device.getInputQueue("face_detect_in")
-        self.reid_q = self.device.getInputQueue("face_id_in")
+        if advanced_ffid:
+            self.ffid_q = self.device.getInputQueue("face_id_in")
         self.pose_q = self.device.getInputQueue("head_pose_in")
 
-        # Init host processing queues and sync counters
+        # Init host processing queues
         self.frame_q = queue.Queue(maxsize=30)
         self.timestamp_q = queue.Queue(maxsize=30)
-        self.new = True  # new frame at front of queue
-        self.face_n = 0
-        self.reid_n = 0
-        self.pose_n = 0
+
+        # Init frame face counters for syncing
+        self.face_done = False
+        self.faces_to_ffid = 0
+        self.faces_to_pose = 0
 
         # Init tracking metrics
-        time.sleep(1)  # wait for camera to boot
+        self.found_faces = []
         self.start_time = datetime.datetime.now()
         self.threads = []
-        if self.debug:
+        self.data = {}
+        self.meta = {'date_time': self.label,
+                     'preview_size': self.preview_size,
+                     'session_length': f"{timeout} min",
+                     'advanced_face_id': advanced_ffid}
+        if debug_mode:
             self.fps = FPS()
             self.fps.start()
             print('Debug mode on.')
+
+        time.sleep(1)  # wait for camera to boot
         if use_camera:
             print('Camera stream started.')
         else:
@@ -169,26 +198,33 @@ class Session:
                 cam.video.link(raw_enc.input)
                 raw_enc.setDefaultProfilePreset(cam.getResolutionSize(), raw_fps,
                                                 dai.VideoEncoderProperties.Profile.H265_MAIN)
-                cam_enc = pipeline.createXLinkOut()
-                cam_enc.setStreamName("video_out")
-                raw_enc.bitstream.link(cam_enc.input)
+                vid_out = pipeline.createXLinkOut()
+                vid_out.setStreamName("video_out")
+                raw_enc.bitstream.link(vid_out.input)
 
         # Setup annotated video encoder stream
         # TODO: test
-        anno_enc = pipeline.createVideoEncoder()
-        anno_xin = pipeline.createXLinkIn()
-        anno_xin.setStreamName('annotated_in')
-        anno_xin.link(anno_enc.input)
-        anno_fps = 25  # lower due to processing TODO: test
-        anno_enc.setDefaultProfilePreset(self.preview_size, anno_fps,
-                                         dai.VideoEncoderProperties.Profile.H265_MAIN)
-        anno_xout = pipeline.createXLinkOut()
-        anno_xout.setStreamName("annotated_out")
-        anno_enc.bitstream.link(anno_xout.input)
+        if save_annotated:
+            ann_enc = pipeline.createVideoEncoder()
+            ann_xin = pipeline.createXLinkIn()
+            ann_xin.setStreamName('annotated_in')
+            ann_xin.out.link(ann_enc.input)
+            ann_fps = 25  # lower due to processing TODO: test
+            ann_enc.setDefaultProfilePreset(*self.preview_size, ann_fps,
+                                            dai.VideoEncoderProperties.Profile.H265_MAIN)
+            ann_out = pipeline.createXLinkOut()
+            ann_out.setStreamName("annotated_out")
+            ann_enc.bitstream.link(ann_out.input)
+
         print('Video streams created.')
 
         # Setup neural networks for inference
         for name, blob in self.models.items():
+            # Skip if not needed
+            if not advanced_ffid and (name == 'face_id'):
+                continue
+
+            # Create nnet
             blob_path = Path('models', blob).resolve().absolute()
             model = pipeline.createNeuralNetwork()
             model.setBlobPath(str(blob_path))
@@ -213,18 +249,11 @@ class Session:
                    (timedelta.microseconds / 1000))
         return ms
 
-    @staticmethod
-    # TODO needed???
-    def to_tensor_result(packet):
-        return {
-            tensor.name: np.array(packet.getLayerFp16(tensor.name)).reshape(tensor.dims)
-            for tensor in packet.getRaw().tensors
-        }
-
     def still_running(self):
         # Check if camera should timeout
         elapsed_min = (datetime.datetime.now() - self.start_time).seconds / 60
         if elapsed_min > timeout:
+            print(f'Timeout of {timeout} minutes elapsed, session ending.')
             self.running = False
 
         # Check if camera is still running
@@ -239,16 +268,15 @@ class Session:
             if not msg:
                 return
             frame = msg.getCvFrame().astype(np.uint8)  # BGR format
-            elapsed = msg.getTimestamp()
-            print(frame.shape)  # TODO delete
-
         else:
             # Read frame from video source
             valid, frame = self.source.read()
             if not valid or frame is None:
                 return
             frame = cv2.resize(frame, self.preview_size).astype(np.uint8)  # BGR format
-            elapsed = datetime.datetime.now() - self.start_time
+
+        # Get elapsed time from host side
+        elapsed = datetime.datetime.now() - self.start_time
 
         # Queue up frame for further processing
         self.frame_q.put(frame)
@@ -256,6 +284,7 @@ class Session:
             self.fps.update()
 
         # Send to face detection nnet flattened and channel reordered [C, H, W]
+        # Data type is uint8
         tensor = dai.NNData()
         frame = cv2.resize(frame, self.model_sizes['face_detect'])
         tensor.setLayer('data', frame.transpose(2, 0, 1).flatten().tolist())
@@ -266,47 +295,42 @@ class Session:
         self.timestamp_q.put(timestamp)
         self.data[timestamp] = {'face_boxes': [],
                                 'face_ids': [],
-                                'head_coords': [],
+                                # 'head_coords': [],
+# TODO implement https://docs.luxonis.com/projects/api/en/latest/samples/spatial_location_calculator/
                                 'head_angles': []}
 
     def run_face_detect(self):
-        face_detect_q = self.device.getOutputQueue('face_detect')
+        face_detect_q = self.device.getOutputQueue('face_detect', maxSize=30, blocking=True)
 
         while self.running:
-            # Wait for new frame
-            if not self.new:
+            # Assure new frame in queue
+            if self.face_done:
                 continue
-            self.new = False
 
             # Get nnet output
             msg = face_detect_q.tryGet()
             if not msg:
                 continue
 
-            # Peek at frame and timestamp
-            frame = self.frame_q.queue[0]  # TODO: need .copy()?
+            # Peek at timestamp and frame
             timestamp = self.timestamp_q.queue[0]
+            frame = self.frame_q.queue[0]  # TODO: need .copy()?
 
             # Filter for bounding boxes with > 70 % confidence
             bboxes = np.array(msg.getFirstLayerFp16())
             bboxes = bboxes.reshape((bboxes.size // 7, 7))
             bboxes = bboxes[bboxes[:, 2] > 0.7][:, 3:7]
 
-            # Store bounding box position as proportion of frame
-            max_bbox = 3  # limit number of faces
-            self.data[timestamp]['face_boxes'] = [bb.tolist() for bb in bboxes[:max_bbox]]
-
             # Send cropped faces to nnets
-            for raw_bbox in bboxes[:max_bbox]:
+            max_bbox = 3  # limit number of faces
+            if not bboxes.size:
+                self.data[timestamp] = None  # no valid data for frame
+            for face_id, raw_bbox in enumerate(bboxes[:max_bbox]):
                 # Convert bounding box coordinates to pixels
                 y_size, x_size = frame.shape[:2]
                 bounds = np.array([x_size, y_size, x_size, y_size])
                 raw_bbox = np.clip(raw_bbox, 0, 1)
                 bbox = (raw_bbox * bounds).astype(np.int)
-
-                # Store head coordinate center as portion of frame, z unknown currently
-                coord = [(raw_bbox[0] + raw_bbox[2]) / 2, (raw_bbox[1] + raw_bbox[3]) / 2, None]
-                self.data[timestamp]['head_coords'].append(coord)
 
                 # Square box for cropping
                 def scale_up(p_min, p_max, p_size, delta):
@@ -334,186 +358,221 @@ class Session:
                 bbox_frame = frame[bbox[1]:bbox[3], bbox[0]:bbox[2]]
 
                 # Send to face identification nnet
-                tensor = dai.NNData()
-                bbox_frame = cv2.resize(bbox_frame, self.model_sizes['face_id'])
-                tensor.setLayer('data', bbox_frame.transpose(2, 0, 1).flatten().tolist())
-                self.reid_q.send(tensor)
+                # Data type is uint8
+                if advanced_ffid:
+                    tensor = dai.NNData()
+                    bbox_frame = cv2.resize(bbox_frame, self.model_sizes['face_id'])
+                    tensor.setLayer('data', bbox_frame.transpose(2, 0, 1).flatten().tolist())
+                    self.ffid_q.send(tensor)
+
+                # Resize, reorder [C x H x W] and normalize channels to ImageNet distribution per paper
+                # Data type is fp16
+                ideal_mean = [0.485, 0.456, 0.406]
+                ideal_std = [0.229, 0.224, 0.225]
+                bbox_frame = cv2.resize(bbox_frame, self.model_sizes['head_pose'])
+                bbox_frame = bbox_frame.transpose(2, 0, 1)
+                bbox_norm = bbox_frame.astype(np.float16)
+                for c in range(bbox_frame.shape[0]):
+                    bbox_norm[c] = ((bbox_norm[c] - bbox_frame[c].mean())
+                                    / bbox_frame[c].std()) * ideal_std[c] + ideal_mean[c]
 
                 # Send to head pose nnet
                 tensor = dai.NNData()
-                bbox_frame = cv2.resize(bbox_frame, self.model_sizes['head_pose'])
-                tensor.setLayer('data', bbox_frame.transpose(2, 0, 1).flatten().tolist())
+                tensor.setLayer('data', bbox_norm.flatten().tolist())
                 self.pose_q.send(tensor)
 
-                # Increment sync counter
-                self.face_n += 1
+                # Store pixel based bounding box
+                self.data[timestamp]['face_boxes'].append(bbox.tolist())
+
+                # Store face ID number if naive method
+                if not advanced_ffid:
+                    self.data[timestamp]['face_ids'].append(face_id)
+
+                # Increment sync counters
+                if advanced_ffid:
+                    self.faces_to_ffid += 1
+                self.faces_to_pose += 1
+
+            # Indicate frame complete
+            self.face_done = True
 
     def run_face_id(self):
-        face_id_q = self.device.getOutputQueue('face_id')
+        face_id_q = self.device.getOutputQueue('face_id', maxSize=30, blocking=True)
 
         while self.running:
+            # Assure new frame in queue
+            if self.faces_to_ffid == 0:
+                continue
+
             # Get nnet output
             msg = face_id_q.tryGet()
             if not msg:
                 continue
 
-            # Peek at frame and timestamp
-            frame = self.frame_q.queue[0].copy()
+            # Peek at timestamp
             timestamp = self.timestamp_q.queue[0]
 
-            # TODO WIP
+            # Read face vector and assign ID number from found faces
+            face_vec = np.array(msg.getFirstLayerFp16()).flatten()
+            face_id = None
+            threshold = 0.5  # TODO verify
+            for i, ref_vec in enumerate(self.found_faces):
+                if cosine(ref_vec, face_vec) < threshold:
+                    face_id = i
+                    break
+            if face_id is None:
+                # New face found
+                face_id = len(self.found_faces)
+                self.found_faces.append(face_vec)
 
+            # Store face ID number
+            self.data[timestamp]['face_ids'].append(face_id)
 
-    # TODO WIP
-    def run_head_pose(self, key_pts):
-        # Fill in the 2D reference point, follow https://ibug.doc.ic.ac.uk/resources/300-W/
-        # reprojectdst, _, pitch, yaw, roll = get_head_pose(np.array(self.hand_points))
+            # Decrement counter when frame complete
+            self.faces_to_ffid -= 1
 
-        # World Coordinate System (UVW) 3D reference points
-        # Face model reference http://aifi.isr.uc.pt/Downloads/OpenGL/glAnthropometric3DModel.cpp
-        ref_pts = np.float32([[6.825897, 6.760612, 4.402142],  # Upper left corner of left eyebrow
-                              [1.330353, 7.122144, 6.903745],  # Left eyebrow right corner
-                              [-1.330353, 7.122144, 6.903745],  # Right eyebrow left corner
-                              [-6.825897, 6.760612, 4.402142],  # Upper right corner of right eyebrow
-                              [5.311432, 5.485328, 3.987654],  # Upper left corner of left eye
-                              [1.789930, 5.393625, 4.413414],  # Upper right corner of left eye
-                              [-1.789930, 5.393625, 4.413414],  # Upper left corner of right eye
-                              [-5.311432, 5.485328, 3.987654],  # Upper right corner of right eye
-                              [2.005628, 1.409845, 6.165652],  # Upper left corner of nose
-                              [-2.005628, 1.409845, 6.165652],  # Upper right corner of nose
-                              [2.774015, -2.080775, 5.048531],  # Upper left corner of mouth
-                              [-2.774015, -2.080775, 5.048531],  # Upper right corner of mouth
-                              [0.000000, -3.116408, 6.097667],  # Lower corner of mouth
-                              [0.000000, -7.415691, 4.070434]])  # Chin angle
+    def run_head_pose(self):
+        head_pose_q = self.device.getOutputQueue('head_pose', maxSize=30, blocking=True)
 
-        # Calculate the rotation and translation vectors
-        img_pts = np.float32(key_pts)
-        _, rotation, translation = cv2.solvePnP(ref_pts, img_pts, self.K, self.D)
+        while self.running:
+            # Assure new frame in queue
+            if self.faces_to_pose == 0:
+                continue
 
-        # Project unit vectors to visually display head pose
-        length = 10  # non dynamic
-        unit_pts = length * np.float32([(0, 0, 0), (1, 0, 0), (0, -1, 0), (0, 0, 1)])
-        unit_pts, _ = cv2.projectPoints(unit_pts, rotation, translation, self.K, self.D)
-        unit_pts = list(map(tuple, unit_pts.reshape(4, 2)))
+            # Get nnet output
+            msg = head_pose_q.tryGet()
+            if not msg:
+                continue
 
-        # Calculate Euler angle
-        rotation_v = cv2.Rodrigues(rotation)[0]  # convert rotation matrix to a rotation vector
-        pose_matrix = cv2.hconcat((rotation_v, translation))
-        euler_angle = cv2.decomposeProjectionMatrix(pose_matrix)[-1]
+            # Peek at timestamp
+            timestamp = self.timestamp_q.queue[0]
 
-        # Convert Euler angle into pitch, yaw and roll
-        pitch, yaw, roll = [math.radians(angle) for angle in euler_angle]
-        pitch = math.degrees(math.asin(math.sin(pitch)))
-        roll = -math.degrees(math.asin(math.sin(roll)))
-        yaw = math.degrees(math.asin(math.sin(yaw)))
+            # Read head pose angles
+            yaw_name, pitch_name, roll_name = msg.getAllLayerNames()
+            yaw = np.array(msg.getLayerFp16(yaw_name)).flatten()
+            pitch = np.array(msg.getLayerFp16(pitch_name)).flatten()
+            roll = np.array(msg.getLayerFp16(roll_name)).flatten()
 
-        return unit_pts, pitch, yaw, roll
+            # Calculate angle in degrees using softmax approach
+            # Ref: https://github.com/natanielruiz/deep-head-pose/blob/master/code/test_hopenet.py
+            # Softmax weights the angles by their probability bins
+            # Scale and center to -99 to +99 degree output range
+            yaw = np.sum(softmax(yaw) * np.arange(66)) * 3 - 99
+            pitch = np.sum(softmax(pitch) * np.arange(66)) * 3 - 99
+            roll = np.sum(softmax(roll) * np.arange(66)) * 3 - 99
 
-    def run_head_locate(self):
-        # Triangulate to estimate head position from camera in meters
-        # TODO WIP
+            # Store head angles
+            self.data[timestamp]['head_angles'].append([yaw, pitch, roll])
+
+            # Decrement counter when frame complete
+            self.faces_to_pose -= 1
 
     def run_file_save(self):
         # Save queued encoder frames to video files
-        msg = self.annotated.tryGet()  # annotated
-        if msg:
-            msg.getData().tofile(self.a_file)
-        if save_video:
-            msg = self.video.tryGet()  # raw video
-            if msg:
-                msg.getData().tofile(self.v_file)
+        while self.running:
+            if save_annotated:
+                msg = self.annotated.tryGet()  # annotated
+                if msg:
+                    msg.getData().tofile(self.a_file)
+            if save_video:
+                msg = self.video.tryGet()  # raw video
+                if msg:
+                    msg.getData().tofile(self.v_file)
 
     def run(self):
+        # Queue up an initial frame
+        self.grab_frame()
+
         # Start neural network threads
-        self.threads = [
-            threading.Thread(target=self.run_face_detect),
-            threading.Thread(target=self.run_face_id),
-            threading.Thread(target=self.run_head_pose),
-            threading.Thread(target=self.run_head_locate),
-            threading.Thread(target=self.run_file_save)]
+        self.threads = [threading.Thread(target=self.run_face_detect),
+                        threading.Thread(target=self.run_head_pose)]
+        if advanced_ffid:
+            self.threads.append(threading.Thread(target=self.run_face_id))
+        if save_annotated or save_video:
+            self.threads.append(threading.Thread(target=self.run_file_save))
         for thread in self.threads:
             thread.start()
 
         # Run loop
         while self.still_running():
-            # Queue up a frame for inference
-            self.grab_frame()
-
-            # Assure frame in queue
-            if self.frame_q.qsize() == 0:
-                continue
-
             # Wait for nnets to sync
-            if (self.reid_n < self.face_n) or (self.pose_n < self.face_n):
+            if not self.face_done or (self.faces_to_ffid + self.faces_to_pose) > 0:
                 continue
+
+            # Queue up a new frame for inference
+            self.grab_frame()
 
             # Consume frame and timestamp from queue
             frame = self.frame_q.get()
             timestamp = self.timestamp_q.get()
-            self.new = True  # new frame ready for face detection
+
+            # Indicate new frame ready for nnets
+            self.face_done = False
+            if advanced_ffid:
+                self.faces_to_ffid = 0
+            self.faces_to_pose = 0
 
             # Annotate video stream with nnet data results
             data = self.data[timestamp]  # face_boxes, face_ids, head_coords, head_angles
 
             # Draw bounding boxes and pose unit vectors
-            for bbox, angles in zip(data['face_boxes'], data['head_angles']):
-                # Bounding box
-                cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]),
-                              color=(0, 255, 0), thickness=1)
+            if data is not None:
+                for bbox, angles in zip(data['face_boxes'], data['head_angles']):
+                    # Bounding box
+                    cv2.rectangle(frame,
+                                  (bbox[0], bbox[1]),
+                                  (bbox[2], bbox[3]),
+                                  color=(0, 255, 0),
+                                  thickness=1)
 
-                # Unit vectors
-                origin = [int((bbox[0] + bbox[2]) / 2),
-                          int((bbox[1] + bbox[3]) / 2)]  # x, y
-                unit_len = bbox[2] - bbox[0]  # width of bbox
-                unit_pts = [origin, origin, origin]  # init
-                colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]
+                    # Unit vectors
+                    origin = (int((bbox[0] + bbox[2]) / 2),
+                              int((bbox[1] + bbox[3]) / 2))  # x, y
+                    unit_len = int((bbox[2] - bbox[0]) / 2)  # half width of bbox
+                    unit_pts = [None, None, None]  # init
+                    colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # RGB
+                    line_widths = [3, 3, 2]  # front line thinner
 
-                # Convert angles to radians
-                pitch, yaw, roll = angles
-                pitch = pitch * np.pi / 180
-                yaw = -(yaw * np.pi / 180)
-                roll = roll * np.pi / 180
+                    # Convert angles to radians
+                    yaw, pitch, roll = angles
+                    yaw = -(yaw * np.pi / 180)
+                    pitch = pitch * np.pi / 180
+                    roll = roll * np.pi / 180
 
+                    # X axis unit vector pointing to right in red
+                    unit_pts[0] = [int(origin[0] + unit_len * (cos(yaw) * cos(roll))),
+                                   int(origin[1] + unit_len * (cos(pitch) * sin(roll) +
+                                                               cos(roll) * sin(pitch) * sin(yaw)))]
 
-                # X axis unit vector pointing to right in red
-                unit_pts[0][0] += int(unit_len * (cos(yaw) * cos(roll)))
-                unit_pts[0][1] += int(unit_len * (cos(pitch) * sin(roll) +
-                                                  cos(roll) * sin(pitch) * sin(yaw)))
+                    # Y axis unit vector pointing to up in green
+                    unit_pts[1] = [int(origin[0] + unit_len * (-cos(yaw) * sin(roll))),
+                                   int(origin[1] + unit_len * (cos(pitch) * cos(roll) -
+                                                               sin(pitch) * sin(yaw) * sin(roll)))]
 
-                # Y axis unit vector pointing to up in green
-                unit_pts[1][0] += int(unit_len * (-cos(yaw) * sin(roll)))
-                unit_pts[1][1] += int(unit_len * (cos(pitch) * cos(roll) -
-                                                 sin(pitch) * sin(yaw) * sin(roll)))
+                    # Z axis unit vector pointing out of screen in blue
+                    unit_pts[2] = [int(origin[0] + unit_len * (sin(yaw))),
+                                   int(origin[1] + unit_len * (-cos(yaw) * sin(pitch)))]
 
-                # Z axis unit vector pointing out of screen in blue
-                unit_pts[2][0] += int(unit_len * (sin(yaw)))
-                unit_pts[2][1] += int(unit_len * (-cos(yaw) * sin(pitch)))
+                    # Draw vectors
+                    for pt, c, w in zip(unit_pts, colors, line_widths):
+                        cv2.line(frame, origin, tuple(pt), color=c, thickness=w)
 
-                # Draw vectors
-                for pt, c in zip(unit_pts, colors):
-                    cv2.line(frame, origin, pt, color=c, thickness=3)
-
-                # Add FPS text for debug
-                if debug_mode:
-                    cv2.putText(frame, f"FPS：{self.fps.fps():.2f}",
-                               (frame.shape[1] - 30, frame.shape[0] - 10),
-                               fontFace=cv2.FONT_HERSHEY_COMPLEX,
-                               fontScale=0.45, color=(255, 0, 0))
-
-                # Send annotated frame to be encoded to video
+            # Send annotated frame to be encoded to video
+            if save_annotated:
                 img = dai.ImgFrame()
                 img.setHeight(self.preview_size[0])
                 img.setWidth(self.preview_size[1])
                 img.setType(dai.RawImgFrame.Type.BGR888p)
-                img.setFrame(frame.transpose([2, 0, 1]))  # channel first
+                # Requires [C, H, W]
+                img.setFrame(frame.transpose([2, 0, 1]))
                 self.encoder.send(img)
 
-                # Display preview if requested
-                if show_preview:
-                    cv2.imshow("Preview", frame)
-                    if cv2.waitKey(1) == ord('q'):
-                        cv2.destroyAllWindows()
-                        self.running = False
+            # Display preview if requested
+            if show_preview:
+                cv2.imshow("Preview", frame)
+                if cv2.waitKey(1) == ord('q'):
+                    cv2.destroyAllWindows()
+                    self.running = False
 
         self.finish()
         self.write_json()
@@ -523,7 +582,9 @@ class Session:
         # Display debug info
         if debug_mode:
             self.fps.stop()
-            print(f"Average FPS：{self.fps.fps():.2f}")
+            fps_str = f"{self.fps.fps():.2f}"
+            self.meta['average_fps'] = fps_str
+            print(f"Average FPS：{fps_str}")
 
         # Close all threads and stop inference
         for thread in self.threads:
@@ -533,7 +594,8 @@ class Session:
         print('Camera stream ended.')
 
         # Close open video files
-        self.a_file.close()
+        if save_annotated:
+            self.a_file.close()
         if save_video:
             self.v_file.close()
         print('Video files written to disk.')
@@ -545,19 +607,23 @@ class Session:
 
     # TODO WIP
     def write_json(self):
-        # Add UTC style timestamps
-        # TODO
+        # Remove data points with no face
+        valid_data = {}
+        for ts, data in self.data.items():
+            if data is not None:
+                valid_data[ts] = data
 
-        # Remove empty data points
-        meta = {}
-        for key, val in self.meta.items():
-            if val:
-                meta[key] = val
-
-        # Dump to file
+        # Dump data and meta data to file
+        with open(self.store / 'data.txt', 'w') as file:
+            json.dump(valid_data, file)
         with open(self.store / 'meta.txt', 'w') as file:
-            json.dump(meta, file)
+            json.dump(self.meta, file)
         print('Data file written to disk.')
+
+        # Copy to upload folder, will be deleted when uploaded
+        if not debug_mode:
+            dest = Path('upload', self.label).resolve().absolute()
+            shutil.copytree(self.store, dest)
 
 
 if __name__ == '__main__':

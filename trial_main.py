@@ -140,7 +140,7 @@ def create_pipeline():
     print("Creating Head Pose Neural Network...")
     pose_nn = pipeline.createNeuralNetwork()
     pose_nn.setBlobPath(
-        str(Path("models/hopenet-lite/shuff_epoch_120-6shaves-224x224.blob").resolve().absolute())
+        str(Path("models/hopenet-fp16-224x224-6shave.blob").resolve().absolute())
     )
     pose_nn_xin = pipeline.createXLinkIn()
     pose_nn_xin.setStreamName("pose_in")
