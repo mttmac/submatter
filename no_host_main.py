@@ -209,12 +209,17 @@ class Session:
         script.inputs['bboxes'].setBlocking(False)
         script.inputs['bboxes'].setQueueSize(4)
         model.out.link(script.inputs['bboxes'])
+
+        # Set script to crop to bounding box with 5% margin added
         script.setScript("""
 while True:
     bboxes = node.io['bboxes'].get().detections
     for bbox in bboxes:
         cfg = ImageManipConfig()
-        cfg.setCropRect(bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax)
+        cfg.setCropRect(bbox.xmin * 0.95,
+                        bbox.ymin * 0.95,
+                        bbox.xmax * 1.05,
+                        bbox.ymax * 1.05)
         cfg.setResize(224, 224)
         node.io['transform'].send(cfg)
 """)
@@ -337,11 +342,11 @@ while True:
                 for fid, det in enumerate(msg.detections):
                     data['fid'].append(fid)
 
-                    # Convert bounding box to pixels
-                    bbox = np.clip(np.array((det.xmin,
-                                             det.ymin,
-                                             det.xmax,
-                                             det.ymax)), 0, 1)
+                    # Convert bounding box to pixels with 5% margin added
+                    bbox = np.clip(np.array((det.xmin * 0.95,
+                                             det.ymin * 0.95,
+                                             det.xmax * 1.05,
+                                             det.ymax * 1.05)), 0, 1)
                     data['bbx'].append(bbox.tolist())  # store as proportion of frame
                     bbox[0::2] *= frame.shape[1]  # x pixels
                     bbox[1::2] *= frame.shape[0]  # y pixels
