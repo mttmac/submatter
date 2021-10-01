@@ -1,29 +1,29 @@
 # Command reference to load hopenet from repo and convert to onnx
-# Numerical precision is float32
+# Numerical precision is float16
 # Other references: https://github.com/openvinotoolkit/openvino_notebooks/tree/main/notebooks
 
 # Python
 import torch
-import stable_hopenetlite  # must be in ref repo to import, otherwise assume in project repo
+import faster_hopenet_lite
 from pathlib import Path
 
-model = stable_hopenetlite.shufflenet_v2_x1_0()
-net = torch.load(Path('ref/deep-head-pose-lite/model/shuff_epoch_120.pkl'), map_location=torch.device('cpu'))
-model.load_state_dict(net)
+model = faster_hopenet_lite.build_hopenet_lite()
 model.eval()
 dummy_input = torch.randn(1, 3, 224, 224)  # hopenet trained on 224 x 224 images
-torch.onnx.export(model, (dummy_input, ), Path('models/hopenet-lite/shuff_epoch_120-224x224.onnx'))
+torch.onnx.export(model, (dummy_input, ),
+                  Path('models/hopenet-lite/shuff_epoch_120-224x224-faster.onnx'),
+                  opset_version=11)
 
 # Command line macOS
 """
 cd /opt/intel/openvino_2021.4.582/deployment_tools/model_optimizer
-python mo.py --input_model ~/repos/submatter/models/hopenet-lite/shuff_epoch_120-224x224.onnx --output_dir ~/repos/submatter/models/hopenet-lite/ --model_name hopenet-fp16-224x224 --data_type FP16
+python mo.py --input_model ~/repos/submatter/models/hopenet-lite/shuff_epoch_120-224x224-faster.onnx --output_dir ~/repos/submatter/models/hopenet-lite/ --model_name hopenet-faster-fp16-224x224 --data_type FP16
 
 Model Optimizer arguments:
 Common parameters:
-	- Path to the Input Model: 	/Users/mattmacdonald/repos/submatter/models/hopenet-lite/shuff_epoch_120-224x224.onnx
+	- Path to the Input Model: 	/Users/mattmacdonald/repos/submatter/models/hopenet-lite/shuff_epoch_120-224x224-faster.onnx
 	- Path for generated IR: 	/Users/mattmacdonald/repos/submatter/models/hopenet-lite/
-	- IR output name: 	hopenet-fp16-224x224
+	- IR output name: 	hopenet-faster-fp16-224x224
 	- Log level: 	ERROR
 	- Batch: 	Not specified, inherited from the model
 	- Input layers: 	Not specified, inherited from the model
@@ -42,10 +42,10 @@ ONNX specific parameters:
 Inference Engine version: 	2021.4.0-3839-cd81789d294-releases/2021/4
 Model Optimizer version: 	2021.4.0-3839-cd81789d294-releases/2021/4
 [ SUCCESS ] Generated IR version 10 model.
-[ SUCCESS ] XML file: /Users/mattmacdonald/repos/submatter/models/hopenet-lite/hopenet-fp16-224x224.xml
-[ SUCCESS ] BIN file: /Users/mattmacdonald/repos/submatter/models/hopenet-lite/hopenet-fp16-224x224.bin
-[ SUCCESS ] Total execution time: 29.99 seconds.
-[ SUCCESS ] Memory consumed: 97 MB.
+[ SUCCESS ] XML file: /Users/mattmacdonald/repos/submatter/models/hopenet-lite/hopenet-faster-fp16-224x224.xml
+[ SUCCESS ] BIN file: /Users/mattmacdonald/repos/submatter/models/hopenet-lite/hopenet-faster-fp16-224x224.bin
+[ SUCCESS ] Total execution time: 51.45 seconds.
+[ SUCCESS ] Memory consumed: 107 MB.
 """
 
 # To understand model architecture better use torchinfo
@@ -120,10 +120,28 @@ Estimated Total Size (MB): 37.63
 """
 
 # Converting model to blob format can be done online
+# For baseline hopenet option -ip FP16 must be set, otherwise -ip U8 (faster uses U8 input)
+# Note that mean and standard deviation must match below, faster does it in model
+# ideal_mean = [0.485, 0.456, 0.406]
+# ideal_std = [0.229, 0.224, 0.225]
+
+import blobconverter
+# default settings are fp16 precision and uint8 input and version 2021.3
+blob_path = blobconverter.from_openvino(
+    xml="models/hopenet-lite/uint8-input/hopenet-faster-fp16-224x224.xml",
+    bin="models/hopenet-lite/uint8-input/hopenet-faster-fp16-224x224.bin",
+    shaves=6
+)
+
 """
-http://luxonis.com:8080/
+Alternative method
+http://blobconverter.luxonis.com/
 Select version 2021.3, OpenVino model
 The SHAVES are vector processors in DepthAI.
 For 1080p, 13 SHAVES (of 16) are free for neural network stuff.
 For 4K sensor resolution, 10 SHAVES are available for neural operations.
+
+Recommended approach!!!
+Convert direct from ONNX
+Avoid any mean or scale options and set to data type to FP16
 """

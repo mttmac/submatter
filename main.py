@@ -24,12 +24,7 @@ Future - Eye gaze estimation:
 gaze-estimation-adas-0002
 """
 
-# TODO add hopelite head pose (openvino for blob)
-# TODO add non debug mode start and stop control (command line over ssh)
-# TODO sync up bbox and angle meta better to reduce amount of NaN
 # TODO use disparity depth calculation to add 3D space coordinate for head bbox
-# TODO filter to track one bbox only or track individuals
-# TODO add a confidence filter for head pose and store in json meta
 # TODO add eye gaze estimation
 # TODO optional: add rectified disparity video file saving
 
@@ -66,10 +61,10 @@ parser.add_argument('-vid', '--video', type=str,
                     help="Path to video file to be used for inference")
 parser.add_argument('-min', '--minutes', type=int, default=2,
                     help="Session time out in minutes (default 2 mins)")
-parser.add_argument('-ann', '--annotate', type=str,
-                    help="Save annotated preview video")
+parser.add_argument('-ano', '--annotate', action="store_true",
+                    help="Save annotated preview video to h265 when using camera")
 parser.add_argument('-sav', '--save', action="store_true",
-                    help="Save raw source video in 1080P when using OAK-D")
+                    help="Save raw source video to h265 in 1080P when using camera")
 parser.add_argument('-deb', '--debug', action="store_true",
                     help="Enter debug mode to display frames per second")
 parser.add_argument('-adv', '--advanced', action="store_true",
@@ -82,6 +77,8 @@ save_video = args.save
 save_annotated = args.annotate
 advanced_ffid = args.advanced
 use_camera = not args.video
+if save_video or save_annotated:
+    assert use_camera, 'Saving video from file not supported, must use camera.'
 if not use_camera:
     source = Path(args.video).resolve().absolute()
 timeout = args.minutes
@@ -118,9 +115,9 @@ class Session:
             assert (self.preview_size[0] % 8 == 0) and (self.preview_size[1] % 8 == 0), \
                 "Preview size must be multiple of 8 for video encoder."
         self.pipeline = self.create_pipeline()
-        self.device = dai.Device(self.pipeline)
+        self.device = dai.Device()
         print("Starting camera pipeline...")
-        self.running = self.device.startPipeline()
+        self.running = self.device.startPipeline(self.pipeline)
 
         # Init streaming
         if save_annotated:
@@ -144,6 +141,8 @@ class Session:
         # Init host processing queues
         self.frame_q = queue.Queue(maxsize=30)
         self.timestamp_q = queue.Queue(maxsize=30)
+        if save_annotated:
+            self.message_q = queue.Queue(maxsize=30)
 
         # Init frame face counters for syncing
         self.face_done = False
@@ -157,8 +156,8 @@ class Session:
         self.data = {}
         self.meta = {'date_time': self.label,
                      'preview_size': self.preview_size,
-                     'session_length': f"{timeout} min",
-                     'advanced_face_id': advanced_ffid}
+                     'session_time': f"{timeout} min",
+                     'advanced_id': advanced_ffid}
         if debug_mode:
             self.fps = FPS()
             self.fps.start()
@@ -202,19 +201,19 @@ class Session:
                 vid_out.setStreamName("video_out")
                 raw_enc.bitstream.link(vid_out.input)
 
-        # Setup annotated video encoder stream
-        # TODO: test
-        if save_annotated:
-            ann_enc = pipeline.createVideoEncoder()
-            ann_xin = pipeline.createXLinkIn()
-            ann_xin.setStreamName('annotated_in')
-            ann_xin.out.link(ann_enc.input)
-            ann_fps = 25  # lower due to processing TODO: test
-            ann_enc.setDefaultProfilePreset(*self.preview_size, ann_fps,
-                                            dai.VideoEncoderProperties.Profile.H265_MAIN)
-            ann_out = pipeline.createXLinkOut()
-            ann_out.setStreamName("annotated_out")
-            ann_enc.bitstream.link(ann_out.input)
+            # Setup annotated video encoder stream
+            # TODO: test
+            if save_annotated:
+                ano_enc = pipeline.createVideoEncoder()
+                ano_xin = pipeline.createXLinkIn()
+                ano_xin.setStreamName('annotated_in')
+                ano_xin.out.link(ano_enc.input)
+                ano_fps = 3  # lower due to processing TODO: test
+                ano_enc.setDefaultProfilePreset(*self.preview_size, ano_fps,
+                                                dai.VideoEncoderProperties.Profile.H265_MAIN)
+                ano_out = pipeline.createXLinkOut()
+                ano_out.setStreamName("annotated_out")
+                ano_enc.bitstream.link(ano_out.input)
 
         print('Video streams created.')
 
@@ -280,6 +279,8 @@ class Session:
 
         # Queue up frame for further processing
         self.frame_q.put(frame)
+        if save_annotated:
+            self.message_q.put(msg)  # needed for sending annotated frame back
         if debug_mode:
             self.fps.update()
 
@@ -314,7 +315,7 @@ class Session:
 
             # Peek at timestamp and frame
             timestamp = self.timestamp_q.queue[0]
-            frame = self.frame_q.queue[0]  # TODO: need .copy()?
+            frame = self.frame_q.queue[0]
 
             # Filter for bounding boxes with > 70 % confidence
             bboxes = np.array(msg.getFirstLayerFp16())
@@ -559,13 +560,11 @@ class Session:
 
             # Send annotated frame to be encoded to video
             if save_annotated:
-                img = dai.ImgFrame()
-                img.setHeight(self.preview_size[0])
-                img.setWidth(self.preview_size[1])
-                img.setType(dai.RawImgFrame.Type.BGR888p)
-                # Requires [C, H, W]
-                img.setFrame(frame.transpose([2, 0, 1]))
-                self.encoder.send(img)
+                msg = self.message_q.get()
+                grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)  # try grayscale
+                msg.setType(dai.RawImgFrame.Type.YUV400p)
+                msg.setData(grey.flatten().tolist())
+                self.encoder.send(msg)
 
             # Display preview if requested
             if show_preview:
