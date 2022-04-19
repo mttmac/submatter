@@ -61,6 +61,8 @@ parser.add_argument('-nop', '--no-preview', action="store_true",
                     help="Prevent display of an annotated video real time in a preview window")
 parser.add_argument('-nov', '--no-video', action="store_true",
                     help="Prevent saving unannotated source video file")
+parser.add_argument('-nos', '--no-save', action="store_true",
+                    help="Prevent saving data to json file")
 parser.add_argument('-deb', '--debug', action="store_true",
                     help="Enter debug mode to display frames per second")
 
@@ -68,6 +70,7 @@ args = parser.parse_args()
 debug_mode = args.debug
 show_preview = not args.no_preview
 save_video = not args.no_video
+save_data = not args.no_save
 use_camera = not args.file
 if not use_camera:
     source = Path(args.file).resolve().absolute()
@@ -418,7 +421,8 @@ while True:
                     self.running = False
 
         self.finish()
-        self.write_json()
+        if save_data:
+            self.write_json()
         print('Session ended, ready for upload.')
 
     def finish(self):
